@@ -1,0 +1,16 @@
+certifi
+fastapi
+langchain
+langchain-community
+langchain-core
+langchain-openai
+langchain-text-splitters
+langchain-groq
+langgraph
+pydantic
+pydantic_core
+python-dotenv
+pymongo
+SQLAlchemy
+uvicorn
+
