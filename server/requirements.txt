@@ -13,4 +13,6 @@ python-dotenv
 pymongo
 SQLAlchemy
 uvicorn
+python-telegram-bot
+httpx
 

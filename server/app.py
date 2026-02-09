@@ -1,7 +1,7 @@
 from typing import TypedDict, Annotated, Optional
 from langgraph.graph import add_messages, StateGraph, END
 from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, AIMessageChunk, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessageChunk, ToolMessage, SystemMessage
 from dotenv import load_dotenv
 from langchain_community.tools.tavily_search import TavilySearchResults
 from fastapi import FastAPI, Query, HTTPException
@@ -14,16 +14,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from pymongo import MongoClient
 from datetime import datetime
 import os
+import asyncio
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
-# Initialize MongoDB
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/")
 mongo_client = MongoClient(MONGODB_URI)
 db = mongo_client["perplexity_db"]
 chats_collection = db["chats"]
 
-# Initialize memory saver for checkpointing
 memory = MemorySaver()
 
 class State(TypedDict):
@@ -36,13 +36,12 @@ search_tool = TavilySearchResults(
 tools = [search_tool]
 
 llm = ChatGroq(
-    model="qwen/qwen3-32b",
+    model="openai/gpt-oss-120b",
     temperature=0,
     max_tokens=None,
     reasoning_format="parsed",
     timeout=None,
     max_retries=2,
-    # other params...
 )
 
 llm_with_tools = llm.bind_tools(tools=tools)
@@ -63,24 +62,18 @@ async def tools_router(state: State):
     
 async def tool_node(state):
     """Custom tool node that handles tool calls from the LLM."""
-    # Get the tool calls from the last message
     tool_calls = state["messages"][-1].tool_calls
     
-    # Initialize list to store tool messages
     tool_messages = []
     
-    # Process each tool call
     for tool_call in tool_calls:
         tool_name = tool_call["name"]
         tool_args = tool_call["args"]
         tool_id = tool_call["id"]
         
-        # Handle the search tool
         if tool_name == "tavily_search_results_json":
-            # Execute the search tool with the provided arguments
             search_results = await search_tool.ainvoke(tool_args)
             
-            # Create a ToolMessage for this result
             tool_message = ToolMessage(
                 content=str(search_results),
                 tool_call_id=tool_id,
@@ -89,32 +82,68 @@ async def tool_node(state):
             
             tool_messages.append(tool_message)
     
-    # Add the tool messages to the state
     return {"messages": tool_messages}
 
 async def system_node(state):
+    """Add system context with current datetime to messages"""
+    current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+    system_message = f"""You are Qiro, a helpful AI assistant built by Rohan Bidkar. 
+Current date and time: {current_datetime}
+
+Answer user questions concisely and helpfully. When users ask about current events, 
+today's date, or time-sensitive information, use the current datetime above as context.
+Always provide accurate and up-to-date information."""
+    
     return {
         "messages": [
-            {"role": "system", "content": "You are Qiro a helpful assistant built by Rohan Bidkar."}
+            SystemMessage(content=system_message)
         ]
     }
 
 graph_builder = StateGraph(State)
 
-graph_builder.add_node("model", model)
 graph_builder.add_node("system_node", system_node)
+graph_builder.add_node("model", model)
 graph_builder.add_node("tool_node", tool_node)
-graph_builder.set_entry_point("model")
+graph_builder.set_entry_point("system_node")
 
+graph_builder.add_edge("system_node", "model")
 graph_builder.add_conditional_edges("model", tools_router)
 graph_builder.add_edge("tool_node", "model")
-graph_builder.add_edge("model","system_node")
+graph_builder.add_edge("model", END)
 
 graph = graph_builder.compile(checkpointer=memory)
 
-app = FastAPI()
+# Telegram Bot Setup
+telegram_app = None
 
-# Add CORS middleware with settings that match frontend requirements
+async def lifespan(app: FastAPI):
+    """Manage the lifespan of the FastAPI application with Telegram bot."""
+    global telegram_app
+    
+    # Startup
+    try:
+        from telegram_handler import setup_telegram_bot, start_telegram_bot_async
+        telegram_app = setup_telegram_bot()
+        await start_telegram_bot_async(telegram_app)
+        print("[OK] Telegram bot started successfully!")
+    except Exception as e:
+        print(f"[WARNING] Could not start Telegram bot: {e}")
+        telegram_app = None
+    
+    yield
+    
+    # Shutdown
+    try:
+        if telegram_app:
+            from telegram_handler import stop_telegram_bot_async
+            await stop_telegram_bot_async(telegram_app)
+            print("[OK] Telegram bot stopped successfully!")
+    except Exception as e:
+        print(f"[WARNING] Error stopping Telegram bot: {e}")
+
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  
@@ -136,7 +165,6 @@ async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = N
     is_new_conversation = checkpoint_id is None
     
     if is_new_conversation:
-        # Generate new checkpoint ID for first message in conversation
         new_checkpoint_id = str(uuid4())
 
         config = {
@@ -145,14 +173,12 @@ async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = N
             }
         }
         
-        # Initialize with first message
         events = graph.astream_events(
             {"messages": [HumanMessage(content=message)]},
             version="v2",
             config=config
         )
         
-        # First send the checkpoint ID
         yield f"data: {{\"type\": \"checkpoint\", \"checkpoint_id\": \"{new_checkpoint_id}\"}}\n\n"
     else:
         config = {
@@ -160,7 +186,6 @@ async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = N
                 "thread_id": checkpoint_id
             }
         }
-        # Continue existing conversation
         events = graph.astream_events(
             {"messages": [HumanMessage(content=message)]},
             version="v2",
@@ -172,40 +197,31 @@ async def generate_chat_responses(message: str, checkpoint_id: Optional[str] = N
         
         if event_type == "on_chat_model_stream":
             chunk_content = serialise_ai_message_chunk(event["data"]["chunk"])
-            # Escape single quotes and newlines for safe JSON parsing
             safe_content = chunk_content.replace("'", "\\'").replace("\n", "\\n")
             
             yield f"data: {{\"type\": \"content\", \"content\": \"{safe_content}\"}}\n\n"
             
         elif event_type == "on_chat_model_end":
-            # Check if there are tool calls for search
             tool_calls = event["data"]["output"].tool_calls if hasattr(event["data"]["output"], "tool_calls") else []
             search_calls = [call for call in tool_calls if call["name"] == "tavily_search_results_json"]
             
             if search_calls:
-                # Signal that a search is starting
                 search_query = search_calls[0]["args"].get("query", "")
-                # Escape quotes and special characters
                 safe_query = search_query.replace('"', '\\"').replace("'", "\\'").replace("\n", "\\n")
                 yield f"data: {{\"type\": \"search_start\", \"query\": \"{safe_query}\"}}\n\n"
                 
         elif event_type == "on_tool_end" and event["name"] == "tavily_search_results_json":
-            # Search completed - send results or error
             output = event["data"]["output"]
             
-            # Check if output is a list 
             if isinstance(output, list):
-                # Extract URLs from list of search results
                 urls = []
                 for item in output:
                     if isinstance(item, dict) and "url" in item:
                         urls.append(item["url"])
                 
-                # Convert URLs to JSON and yield them
                 urls_json = json.dumps(urls)
                 yield f"data: {{\"type\": \"search_results\", \"urls\": {urls_json}}}\n\n"
     
-    # Send an end event
     yield f"data: {{\"type\": \"end\"}}\n\n"
 
 @app.get("/chat_stream/{message}")
@@ -215,12 +231,19 @@ async def chat_stream(message: str, checkpoint_id: Optional[str] = Query(None)):
         media_type="text/event-stream"
     )
 
-# MongoDB Chat Management Endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "telegram_bot_active": telegram_app is not None
+    }
+
+
 @app.get("/chats")
 async def get_chats(user_id: Optional[str] = Query(None)):
     """Get all chats for the current user"""
     try:
-        # Filter by user_id if provided
         query = {"user_id": user_id} if user_id else {}
         chats = list(chats_collection.find(query, {"_id": 0}).sort("created_at", -1).limit(50))
         return {"chats": chats}
@@ -231,7 +254,6 @@ async def get_chats(user_id: Optional[str] = Query(None)):
 async def get_chat(chat_id: str, user_id: Optional[str] = Query(None)):
     """Get a specific chat by ID"""
     try:
-        # Build query with user_id if provided
         query = {"id": chat_id}
         if user_id:
             query["user_id"] = user_id
@@ -274,7 +296,6 @@ async def update_chat(chat_id: str, chat_data: dict, user_id: Optional[str] = Qu
         if "title" in chat_data:
             update_data["title"] = chat_data["title"]
         
-        # Build query with user_id if provided for security
         query = {"id": chat_id}
         if user_id:
             query["user_id"] = user_id
@@ -293,7 +314,7 @@ async def update_chat(chat_id: str, chat_data: dict, user_id: Optional[str] = Qu
 async def delete_chat(chat_id: str, user_id: Optional[str] = Query(None)):
     """Delete a chat"""
     try:
-        # Build query with user_id if provided for security
+
         query = {"id": chat_id}
         if user_id:
             query["user_id"] = user_id
@@ -305,11 +326,8 @@ async def delete_chat(chat_id: str, user_id: Optional[str] = Query(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Serve frontend in production
+
 frontend_dist = os.path.join(os.path.dirname(__file__), "..", "client", "dist")
 
 if os.path.exists(frontend_dist):
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="static")
-
-
-# SSE - server-sent events 
